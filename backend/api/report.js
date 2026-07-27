@@ -1,135 +1,129 @@
-// api/report.js
-// Submits a single report to Instagram on behalf of one session.
-// Called once per account per report run. Rate limiting is handled client-side via delay.
+const https = require('https');
+const http  = require('http');
 
-import { ProxyAgent, fetch as undiciFetch } from 'undici';
-
-// Instagram's internal report reason map — these are the values their own app sends
 const REASON_MAP = {
-  spam:        { reason: 'spam',                frx_context: 'account' },
-  scam:        { reason: 'fraud_or_scam',       frx_context: 'account' },
-  impersonate: { reason: 'impersonation',       frx_context: 'account' },
-  hate:        { reason: 'hate_speech',         frx_context: 'account' },
-  violence:    { reason: 'violence_or_threats', frx_context: 'account' },
-  harassment:  { reason: 'bullying',            frx_context: 'account' },
-  adult:       { reason: 'nudity_or_sexual',    frx_context: 'account' },
-  false_info:  { reason: 'false_information',   frx_context: 'account' },
-  ip:          { reason: 'intellectual_property', frx_context: 'account' },
-  sale:        { reason: 'illegal_sales',       frx_context: 'account' },
-  self_harm:   { reason: 'self_harm',           frx_context: 'account' },
-  other:       { reason: 'something_else',      frx_context: 'account' }
+  spam:        'spam',
+  scam:        'fraud_or_scam',
+  impersonate: 'impersonation',
+  hate:        'hate_speech',
+  violence:    'violence_or_threats',
+  harassment:  'bullying',
+  adult:       'nudity_or_sexual',
+  false_info:  'false_information',
+  ip:          'intellectual_property',
+  sale:        'illegal_sales',
+  self_harm:   'self_harm',
+  other:       'something_else'
 };
 
-export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
+module.exports = async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  const { sessionid, target_id, target_user, report_type, proxy } = req.body || {};
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  if (!sessionid || !target_id || !report_type) {
-    return res.status(400).json({ error: 'sessionid, target_id, and report_type required' });
-  }
+  const { sessionid, target_id, report_type } = req.body || {};
+
+  if (!sessionid)   return res.status(400).json({ error: 'sessionid required' });
+  if (!target_id)   return res.status(400).json({ error: 'target_id required' });
+  if (!report_type) return res.status(400).json({ error: 'report_type required' });
 
   const reason = REASON_MAP[report_type];
-  if (!reason) {
-    return res.status(400).json({ error: `Unknown report type: ${report_type}` });
-  }
+  if (!reason) return res.status(400).json({ error: `Unknown report type: ${report_type}` });
 
-  // Step 1: Fetch CSRF token from active session
+  // Step 1: get CSRF token
   let csrfToken;
   try {
-    csrfToken = await fetchCsrf(sessionid, proxy);
+    csrfToken = await fetchCsrf(sessionid);
   } catch (err) {
     return res.status(502).json({ success: false, message: `CSRF fetch failed: ${err.message}` });
   }
 
-  // Step 2: Submit the report
+  // Step 2: submit report
   try {
-    const body = new URLSearchParams({
-      source_name:  reason.frx_context,
-      reason_id:    reason.reason,
-      frx_context:  reason.frx_context
-    });
-
-    const igRes = await igFetch(
-      `https://www.instagram.com/api/v1/users/${target_id}/flag/`,
-      {
-        method:  'POST',
-        headers: buildHeaders(sessionid, csrfToken),
-        body:    body.toString()
-      },
-      proxy
-    );
-
-    const data = await igRes.json().catch(() => ({}));
-
-    if (igRes.status === 200 && (data.status === 'ok' || data.result)) {
-      return res.status(200).json({ success: true, message: 'Report submitted' });
-    }
-
-    if (igRes.status === 400) {
-      return res.status(200).json({ success: false, message: data.message || 'Bad request — session may be rate limited' });
-    }
-
-    if (igRes.status === 401 || igRes.status === 403) {
-      return res.status(200).json({ success: false, message: 'Session expired or unauthorized' });
-    }
-
-    if (igRes.status === 429) {
-      return res.status(200).json({ success: false, message: 'Rate limited — increase delay between reports' });
-    }
-
-    return res.status(200).json({ success: false, message: `Instagram returned HTTP ${igRes.status}` });
-
+    const body    = `source_name=account&reason_id=${encodeURIComponent(reason)}&frx_context=account`;
+    const result  = await submitReport(target_id, sessionid, csrfToken, body);
+    return res.status(200).json(result);
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
+};
+
+function fetchCsrf(sessionid) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'www.instagram.com',
+      path:     '/',
+      method:   'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Cookie':     `sessionid=${sessionid}`,
+        'Accept':     'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      }
+    };
+
+    const req = https.request(options, (r) => {
+      let html = '';
+      r.on('data', chunk => html += chunk);
+      r.on('end', () => {
+        const match = html.match(/"csrf_token":"([^"]+)"/);
+        if (!match) return reject(new Error('CSRF token not found'));
+        resolve(match[1]);
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('CSRF request timed out')); });
+    req.end();
+  });
 }
 
-async function fetchCsrf(sessionid, proxy) {
-  const igRes = await igFetch('https://www.instagram.com/', {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Cookie':     `sessionid=${sessionid}`,
-      'Accept':     'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-    }
-  }, proxy);
+function submitReport(targetId, sessionid, csrfToken, body) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'www.instagram.com',
+      path:     `/api/v1/users/${targetId}/flag/`,
+      method:   'POST',
+      headers: {
+        'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Cookie':          `sessionid=${sessionid}; csrftoken=${csrfToken}`,
+        'X-CSRFToken':     csrfToken,
+        'Content-Type':    'application/x-www-form-urlencoded',
+        'Content-Length':  Buffer.byteLength(body),
+        'Referer':         'https://www.instagram.com/',
+        'Origin':          'https://www.instagram.com',
+        'X-IG-App-ID':     '936619743392459',
+        'Accept':          'application/json',
+        'Accept-Language': 'en-US,en;q=0.9'
+      }
+    };
 
-  const html  = await igRes.text();
-  const match = html.match(/"csrf_token":"([^"]+)"/);
-  if (!match) throw new Error('CSRF token not found in response');
-  return match[1];
-}
+    const req = https.request(options, (r) => {
+      let data = '';
+      r.on('data', chunk => data += chunk);
+      r.on('end', () => {
+        let parsed = {};
+        try { parsed = JSON.parse(data); } catch {}
 
-async function igFetch(url, options, proxy) {
-  if (proxy) {
-    const proxyUrl    = buildProxyUrl(proxy);
-    const dispatcher  = new ProxyAgent({ uri: proxyUrl, timeout: 12000 });
-    return undiciFetch(url, { ...options, dispatcher });
-  }
-  return fetch(url, options);
-}
+        if (r.statusCode === 200 && (parsed.status === 'ok' || parsed.result)) {
+          return resolve({ success: true, message: 'Report submitted' });
+        }
+        if (r.statusCode === 401 || r.statusCode === 403) {
+          return resolve({ success: false, message: 'Session expired or unauthorized' });
+        }
+        if (r.statusCode === 429) {
+          return resolve({ success: false, message: 'Rate limited — increase delay' });
+        }
 
-function buildHeaders(sessionid, csrfToken) {
-  return {
-    'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Cookie':          `sessionid=${sessionid}; csrftoken=${csrfToken}`,
-    'X-CSRFToken':     csrfToken,
-    'Content-Type':    'application/x-www-form-urlencoded',
-    'Referer':         'https://www.instagram.com/',
-    'Origin':          'https://www.instagram.com',
-    'X-IG-App-ID':     '936619743392459',
-    'Accept':          'application/json, text/plain, */*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Sec-Fetch-Site':  'same-origin',
-    'Sec-Fetch-Mode':  'cors',
-    'Sec-Fetch-Dest':  'empty'
-  };
-}
+        resolve({ success: false, message: parsed.message || `Instagram returned HTTP ${r.statusCode}` });
+      });
+    });
 
-function buildProxyUrl(p) {
-  const proto = ['socks5', 'socks4'].includes(p.type) ? p.type : 'http';
-  const auth  = p.user && p.pass ? `${encodeURIComponent(p.user)}:${encodeURIComponent(p.pass)}@` : '';
-  return `${proto}://${auth}${p.host}:${p.port}`;
+    req.on('error', reject);
+    req.setTimeout(12000, () => { req.destroy(); reject(new Error('Report request timed out')); });
+    req.write(body);
+    req.end();
+  });
 }
