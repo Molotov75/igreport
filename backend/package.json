@@ -2,11 +2,7 @@
   "name": "recoverds-backend",
   "version": "1.0.0",
   "private": true,
-  "type": "module",
-  "dependencies": {
-    "undici": "^6.6.2"
-  },
   "engines": {
-    "node": ">=18"
+    "node": "18"
   }
 }
